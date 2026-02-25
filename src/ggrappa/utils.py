@@ -92,13 +92,56 @@ def get_src_tgs_blocks(blocks, idxs_src, idxs_tgs, check_type='acs'):
     return src_list, tgs_list
 
 def get_grappa_filled_data_and_loc(sig, rec, params):
-    #rec[:, np.abs(sig).sum(axis=0)!=0] = 0
-    sampled_mask = np.abs(rec).sum(axis=0) != 0
-    extra_data = rec[:, sampled_mask]
-    rec_loc = np.nonzero(sampled_mask)
-    rec_loc = np.asarray(rec_loc).T
-    extra_loc = rec_loc / params['img_size'] - 0.5
-    return extra_loc, extra_data
+    """
+    Batch-safe version.
+
+    Inputs:
+      sig, rec: np.ndarray of shape (B, C, kx, ky, kz)
+      params['img_size'] must correspond to (kx, ky, kz) scaling used by your code.
+
+    Returns:
+      extra_loc:  (B, Nmax, 3)  float, padded with NaN
+      extra_data: (B, C, Nmax)  complex/float, padded with 0
+      counts:     (B,) number of valid samples per batch
+    """
+    if rec.ndim != 5:
+        raise ValueError(f"Expected rec to have shape (B,C,kx,ky,kz). Got {rec.shape}")
+    if sig is not None and sig.shape != rec.shape:
+        raise ValueError(f"sig and rec must have same shape. Got sig {sig.shape}, rec {rec.shape}")
+
+    B, C, kx, ky, kz = rec.shape
+
+    # Mask per batch: collapse coils only
+    sampled_mask = np.abs(rec).sum(axis=1) != 0   # (B, kx, ky, kz)
+
+    counts = sampled_mask.reshape(B, -1).sum(axis=1).astype(int)
+    Nmax = int(counts.max()) if B > 0 else 0
+
+    extra_data = np.zeros((B, C, Nmax), dtype=rec.dtype)
+    extra_loc = np.full((B, Nmax, 3), np.nan, dtype=np.float32)
+
+    img = np.asarray(params["img_size"], dtype=np.float32)
+    # IMPORTANT: img_size ordering must match (kx,ky,kz) here.
+    # If your params['img_size'] is (ky,kz,kx), you must reorder it before using.
+    if img.shape[0] != 3:
+        # allow 2D too, but your code is 3D
+        raise ValueError(f"params['img_size'] must have length 3 for 3D. Got {img}")
+
+    for b in range(B):
+        m = sampled_mask[b]  # (kx,ky,kz)
+        idx = np.nonzero(m)  # tuple of arrays (ix,iy,iz), each length Nb
+        Nb = idx[0].size
+        if Nb == 0:
+            continue
+
+        # data: (C, Nb)
+        extra_data[b, :, :Nb] = rec[b, :, idx[0], idx[1], idx[2]]
+
+        # loc: (Nb, 3) in index coords, then normalize
+        rec_loc = np.stack(idx, axis=1).astype(np.float32)  # (Nb,3) = (ix,iy,iz)
+        extra_loc[b, :Nb] = rec_loc / img - 0.5
+
+    return extra_loc, extra_data, counts
      
 
 def get_cart_portion_sparkling(kspace_shots, traj_params, kspace_data, calc_osf_buffer=10):
