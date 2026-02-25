@@ -9,14 +9,14 @@ import warnings
 from . import GRAPPAReconSpec
 from .utils import extract_sampled_regions, get_indices_from_mask, pad_back_to_size
 
-logger = logger = logging.getLogger(__name__)
+logger = logging.getLogger(__name__)
 
 
 def apply_grappa_kernel(
     sig,
     grappa_recon_spec: GRAPPAReconSpec,
     *,
-    batch_size: int = 1,          # NOTE: this is the "y-chunk batch" from your original code
+    batch_size: int = 1,          # this is your y-chunk batching, NOT the patch batch dim
     isGolfSparks: bool = False,
     mask=None,
     cuda: bool = False,
@@ -55,6 +55,19 @@ def apply_grappa_kernel(
     vol_shape = (ky, kz, kx)
 
     # ---------------------------------------------------------
+    # (1b) Normalize kernel shape:
+    #   - allow (F,G)  -> expand to (B,F,G)
+    #   - allow (B,F,G) -> use as-is
+    # ---------------------------------------------------------
+    if grappa_kernel.ndim == 2:
+        grappa_kernel = grappa_kernel.unsqueeze(0).expand(B, -1, -1).contiguous()
+    elif grappa_kernel.ndim == 3:
+        if grappa_kernel.shape[0] != B:
+            raise ValueError(f"Kernel batch {grappa_kernel.shape[0]} must match sig batch {B}.")
+    else:
+        raise ValueError(f"grappa_kernel must have shape (F,G) or (B,F,G). Got {grappa_kernel.shape}")
+
+    # ---------------------------------------------------------
     # (2) Mask handling (broadcast mask to (B,C,ky,kz,kx) if needed)
     # ---------------------------------------------------------
     if mask is not None:
@@ -78,11 +91,10 @@ def apply_grappa_kernel(
     shift_y, shift_z = 0, 0
 
     if isGolfSparks:
-        # extract_sampled_regions is assumed batch-ready (B,C,ky,kz,kx)
         sig, start_loc, end_loc = extract_sampled_regions(sig, acs_only=False)
 
-        # Measure shift using batch 0 (assumes same sampling geometry across batch)
-        sig_sampled_pat = sig[0].abs().sum(0).sum(-1) != 0  # (ky,kz)
+        # shift estimation uses batch 0 (assumes same sampling geometry across batch)
+        sig_sampled_pat = sig[0].abs().sum(0).sum(-1) != 0
         kernel_pat = idxs_src[..., 0]
         y_multi = sig_sampled_pat.shape[0] // tbly // 2
         z_multi = sig_sampled_pat.shape[1] // tblz // 2
@@ -108,64 +120,45 @@ def apply_grappa_kernel(
             warnings.warn(
                 "Could not find the kernel pattern in the sampled region. Using the center of the sampled region as the kernel pattern."
             )
-
     else:
-        # Use batch 0 to estimate shift (assumes same sampling across batch)
-        # original: shift_y, shift_z = abs(sig).sum(0).sum(-1).nonzero()[0]
         shift_y, shift_z = sig[0].abs().sum(0).sum(-1).nonzero()[0].tolist()
 
     rec = torch.zeros_like(sig)
 
-    # NOTE: batch_size here is "y chunk batch" from original code; avoid confusion with B
     y_chunk_batch = batch_size
-
     size_chunk_y = sbly + tbly * (y_chunk_batch - 1)
-    y_ival = range(shift_y, max(rec.shape[2] - sbly, 1), tbly * y_chunk_batch)  # ky dimension is 2 now
-    z_ival = np.arange(0, max(rec.shape[3] - sblz, 1), tblz)                    # kz dimension is 3 now
+    y_ival = range(shift_y, max(rec.shape[2] - sbly, 1), tbly * y_chunk_batch)
+    z_ival = np.arange(0, max(rec.shape[3] - sblz, 1), tblz)
 
     if not quiet:
         logger.info("GRAPPA Reconstruction...")
 
     cnt = shift_z
-    idxs_src = idxs_src.flatten()
+    idxs_src_flat = idxs_src.flatten()
+    nsrc = int(idxs_src_flat.sum().item())
+    Fdim = nc * nsrc  # feature dimension expected by kernel
 
     for y in tqdm(y_ival, disable=quiet):
-        # ---------------------------------------------------------
-        # (3) y-slicing now on ky dimension (dim=2): sig[:,:, y: ...]
-        # ---------------------------------------------------------
         sig_y = sig[:, :, y : y + size_chunk_y, :, :]
         sig_y = sig_y.cuda() if cuda and cuda_mode in ["all", "application"] else sig_y
 
         zival = cnt + z_ival
         for z in zival:
-            # ---------------------------------------------------------
-            # (4) Build blocks with correct dims for batched sig
-            # sig_y: (B,C,ky_chunk,kz,kx)
-            # slice kz: z:z+sblz -> (B,C,ky_chunk,sblz,kx)
-            # unfold ky dim=2 and kx dim=4
-            # ---------------------------------------------------------
             blocks = sig_y[:, :, :, z : z + sblz, :].unfold(dimension=2, size=sbly, step=tbly) \
                                                    .unfold(dimension=4, size=sblx, step=tblx)
-            # blocks shape: (B, C, nY, sblz, nX, sbly, sblx) or similar depending on unfold ordering
-            # Let's permute to: (B, nY, nX, C, sbly, sblz, sblx)
-            blocks = blocks.permute(0, 2, 4, 1, 5, 3, 6)
+            blocks = blocks.permute(0, 2, 4, 1, 5, 3, 6)  # (B,nY,nX,C,sbly,sblz,sblx)
 
-            cur_batch_sz_y = blocks.shape[1]   # nY
-            cur_batch_sz_x = blocks.shape[2]   # nX
+            cur_batch_sz_y = blocks.shape[1]
+            cur_batch_sz_x = blocks.shape[2]
 
-            blocks = blocks.reshape(B, cur_batch_sz_y, cur_batch_sz_x, nc, -1)[..., idxs_src]
+            blocks = blocks.reshape(B, cur_batch_sz_y, cur_batch_sz_x, nc, -1)[..., idxs_src_flat]
+            # blocks: (B,nY,nX,C,nsrc)
 
-            # ---------------------------------------------------------
-            # (5) Fully-sampled test now sums over coil dimension at dim=3
-            # blocks: (B, nY, nX, C, nSrc)
-            # ---------------------------------------------------------
-            are_targets_fully_sampled = (blocks.abs().sum(3) != 0).sum(-1) == idxs_src.sum()  # (B,nY,nX)
+            are_targets_fully_sampled = (blocks.abs().sum(3) != 0).sum(-1) == idxs_src_flat.sum()  # (B,nY,nX)
 
             if isGolfSparks:
                 if not torch.any(are_targets_fully_sampled):
                     continue
-
-                locs = torch.nonzero(are_targets_fully_sampled, as_tuple=True)  # (b_idx, y_idx, x_idx)
 
                 res = torch.zeros(
                     (B, cur_batch_sz_y, cur_batch_sz_x, nc, tbly, tblz, tblx),
@@ -173,21 +166,25 @@ def apply_grappa_kernel(
                     device=blocks.device,
                 )
 
-                sel = blocks[locs[0], locs[1], locs[2]]  # (N, C, nSrc)
-                sel = sel.reshape(sel.shape[0], -1)
-                res_vals = (sel @ grappa_kernel).reshape(len(locs[0]), nc, tbly, tblz, tblx)
-                res[locs[0], locs[1], locs[2]] = res_vals
+                # Apply correct kernel per batch (ragged selection), loop over batch only
+                for b in range(B):
+                    mask_b = are_targets_fully_sampled[b]  # (nY,nX)
+                    if not torch.any(mask_b):
+                        continue
+                    loc_yx = torch.nonzero(mask_b, as_tuple=False)  # (Nb,2)
+                    sel = blocks[b, loc_yx[:, 0], loc_yx[:, 1]]      # (Nb,C,nsrc)
+                    sel = sel.reshape(sel.shape[0], Fdim)            # (Nb,F)
+                    out = (sel @ grappa_kernel[b]).reshape(sel.shape[0], nc, tbly, tblz, tblx)
+                    res[b, loc_yx[:, 0], loc_yx[:, 1]] = out
 
             else:
-                # Flatten (B*nY*nX, features)
-                blocks2 = blocks.reshape(B * cur_batch_sz_y * cur_batch_sz_x, -1)
-                res = (blocks2 @ grappa_kernel).reshape(B, cur_batch_sz_y, cur_batch_sz_x, nc, tbly, tblz, tblx)
+                # Vectorized per-patch application with batched matmul
+                # X: (B, N, F), W: (B, F, G) -> Y: (B, N, G)
+                X = blocks.reshape(B, cur_batch_sz_y * cur_batch_sz_x, Fdim)
+                Y = torch.bmm(X, grappa_kernel)  # (B, N, G)
 
-            # ---------------------------------------------------------
-            # (6) Write back into rec with batch dim preserved
-            # res: (B,nY,nX,C,tbly,tblz,tblx)
-            # want: (B,C,nY*tbly,tblz,nX*tblx)
-            # ---------------------------------------------------------
+                res = Y.reshape(B, cur_batch_sz_y, cur_batch_sz_x, nc, tbly, tblz, tblx)
+
             res_grid = res.permute(0, 3, 1, 4, 5, 2, 6).reshape(
                 B, nc, cur_batch_sz_y * tbly, tblz, cur_batch_sz_x * tblx
             )
@@ -204,19 +201,15 @@ def apply_grappa_kernel(
         if cuda:
             torch.cuda.empty_cache()
 
-    # Keep acquired samples
     rec[sig.abs() > 0] = sig[sig.abs() > 0]
 
     if isGolfSparks:
         rec = pad_back_to_size(rec, vol_shape, start_loc, end_loc)
     else:
-        # Remove padding (ky dim is 2, kz dim is 3, kx dim is 4 now)
         if sbly > 1:
             rec = rec[:, :, (af[0] - ypos) % tbly + ypos : -(sbly - ypos - tbly), :, :]
-
         if sblz > 1:
             rec = rec[:, :, :, (af[1] - zpos) % tblz + zpos : -(sblz - zpos - tblz), :]
-
         if sblx > 1:
             rec = rec[:, :, :, :, xpos : -(sblx - xpos - tblx)]
 
@@ -235,7 +228,6 @@ def apply_grappa_kernel(
             ]
 
         rec *= mask_crop_bc
-
         not_mask = (~mask_crop_bc) if mask_crop_bc.dtype == torch.bool else (1 - mask_crop_bc)
 
         sig_[..., left[0] : left[0] + size[0],
@@ -245,15 +237,11 @@ def apply_grappa_kernel(
                                    left[1] : left[1] + size[1],
                                    left[2] : left[2] + size[2]] + rec
         )
-
         rec = sig_
 
     if not quiet:
         logger.info("GRAPPA Reconstruction done.")
 
-    # ---------------------------------------------------------
-    # (7) Preserve old API: if input was unbatched, squeeze batch dim back out
-    # ---------------------------------------------------------
     if squeeze_batch:
         rec = rec.squeeze(0)
 
