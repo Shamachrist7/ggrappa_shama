@@ -19,44 +19,77 @@ def get_indices_from_mask(mask):
 
     return min_indices, cube_dimensions
 
+
 def get_src_tgs_blocks(blocks, idxs_src, idxs_tgs, check_type='acs'):
-    """Extracts source and target blocks from the given blocks tensor based on specified indices.
-    
-    Parameters
-    ----------
-    blocks : torch.Tensor
-        A tensor containing the blocks from which to extract source and target blocks.
-    idxs_src : torch.Tensor
-        A tensor containing the indices of the source blocks to be extracted.
-    idxs_tgs : torch.Tensor
-        A tensor containing the indices of the target blocks to be extracted.
-    check_type : str, optional
-        The type of check to perform when selecting blocks. Options are 'acs' and 'all_sampled_srcs'.
-        Default is 'acs'.
-        If 'acs', the function will select blocks where all samples are present.
-        If 'all_sampled_srcs', the function will select blocks where all samples are present in the source locations.
-        
-    Returns
-    -------
-    select_blocks_src : torch.Tensor
-        A tensor containing the selected source blocks.
-    select_blocks_tgs : torch.Tensor
-        A tensor containing the selected target blocks.
     """
-    
-    if check_type == 'acs':
-        samples_per_block = (blocks.sum(dim=0)!=0).sum(dim=(-3, -2, -1))
-        locy, locz, locx = torch.nonzero(samples_per_block == idxs_src.numel(), as_tuple=True)
-    elif check_type == 'all_sampled_srcs':
-        #TODO: Test if this works
-        srcs_per_block = blocks[..., idxs_src].sum(dim=-1)
-        tgs_per_block = blocks[..., idxs_tgs].sum(dim=-1)
-        locy, locz, locx = torch.nonzero(
-            (srcs_per_block.abs() == torch.sum(idxs_src)) and (tgs_per_block.abs() < torch.sum(idxs_tgs)),
-            as_tuple=True,
-        )
-    select_blocks = blocks[:, locy, locz, locx]
-    return select_blocks[..., idxs_src], select_blocks[..., idxs_tgs]
+    Supports:
+      blocks shape:
+        - (C, nY, nZ, nX, sbly, sblz, sblx)
+        - (B, C, nY, nZ, nX, sbly, sblz, sblx)
+
+    Returns:
+      If unbatched: (src, tgs) with shapes (C, N, nsp) and (C, N, ntg)
+      If batched: (src_list, tgs_list), lists of length B where each element is
+                  (C, N_b, nsp) and (C, N_b, ntg)
+    """
+    if blocks.ndim == 7:
+        # Unbatched: (C, nY, nZ, nX, sbly, sblz, sblx)
+        C = blocks.shape[0]
+        blocks_u = blocks
+        batched = False
+    elif blocks.ndim == 8:
+        # Batched: (B, C, nY, nZ, nX, sbly, sblz, sblx)
+        batched = True
+    else:
+        raise ValueError(f"blocks must be 7D or 8D. Got shape {blocks.shape}")
+
+    nsp = int(idxs_src.sum().item())
+    ntg = int(idxs_tgs.sum().item())
+
+    def _select_one(blocks_one):
+        # blocks_one: (C, nY, nZ, nX, sbly, sblz, sblx)
+        if check_type == 'acs':
+            # Count nonzero entries per block (across coils), require full sampling in the whole block
+            # blocks_one.sum(dim=0): (nY,nZ,nX,sbly,sblz,sblx)
+            samples_per_block = (blocks_one.sum(dim=0) != 0).sum(dim=(-3, -2, -1))  # (nY,nZ,nX)
+            locy, locz, locx = torch.nonzero(samples_per_block == idxs_src.numel(), as_tuple=True)
+
+        elif check_type == 'all_sampled_srcs':
+            # Require: all src locations present AND at least one target missing (common “need to reconstruct” criterion)
+            srcs_per_block = blocks_one[..., idxs_src].abs().sum(dim=-1)  # (C,nY,nZ,nX,nsp)->sum over nsp => (C,nY,nZ,nX)
+            tgs_per_block  = blocks_one[..., idxs_tgs].abs().sum(dim=-1)  # (C,nY,nZ,nX,ntg)->sum over ntg => (C,nY,nZ,nX)
+
+            # Aggregate across coils to decide presence
+            src_ok = (srcs_per_block.sum(dim=0) != 0)  # (nY,nZ,nX)
+            tgs_ok = (tgs_per_block.sum(dim=0) != 0)   # (nY,nZ,nX)
+
+            # all sampled srcs AND (not fully sampled targets)
+            cond = src_ok & (~tgs_ok)
+            locy, locz, locx = torch.nonzero(cond, as_tuple=True)
+
+        else:
+            raise ValueError(f"Unknown check_type: {check_type}")
+
+        if locy.numel() == 0:
+            # Return empty tensors with correct ranks
+            src_empty = blocks_one.new_empty((C, 0, nsp))
+            tgs_empty = blocks_one.new_empty((C, 0, ntg))
+            return src_empty, tgs_empty
+
+        select_blocks = blocks_one[:, locy, locz, locx]  # (C, N, sbly, sblz, sblx)
+        return select_blocks[..., idxs_src], select_blocks[..., idxs_tgs]  # (C,N,nsp), (C,N,ntg)
+
+    if not batched:
+        return _select_one(blocks_u)
+
+    # Batched: return ragged lists
+    B = blocks.shape[0]
+    src_list, tgs_list = [], []
+    for b in range(B):
+        src_b, tgs_b = _select_one(blocks[b])
+        src_list.append(src_b)
+        tgs_list.append(tgs_b)
+    return src_list, tgs_list
 
 def get_grappa_filled_data_and_loc(sig, rec, params):
     #rec[:, np.abs(sig).sum(axis=0)!=0] = 0
