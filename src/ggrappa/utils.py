@@ -69,39 +69,79 @@ def get_grappa_filled_data_and_loc(sig, rec, params):
      
 
 def get_cart_portion_sparkling(kspace_shots, traj_params, kspace_data, calc_osf_buffer=10):
-    """Extracts and resamples the Cartesian portion of k-space data from the given k-space shots.
-
-    Parameters
-    ----------
-    kspace_shots : numpy.ndarray
-        The k-space trajectory shots.
-    traj_params : dict
-        Dictionary containing trajectory parameters, including 'img_size'.
-    kspace_data : numpy.ndarray
-        The k-space data corresponding to the shots.
-    calc_osf_buffer:  float, optional
-        The oversampling factor for resampling, by default 1.
+    """
+    Same behavior as before for kspace_data shaped [C, ...],
+    but now also supports batched kspace_data shaped [B, C, ...].
 
     Returns
     -------
-    numpy.ndarray
-        The gridded k-space data with the Cartesian portion resampled and placed in the appropriate locations.
+    gridded_data : np.ndarray
+        [C, *img_size] if input was [C, ...]
+        [B, C, *img_size] if input was [B, C, ...]
+    new_kspace_data : np.ndarray
+        [C, ...] stacked across rows (legacy behavior) or [B, C, ...] if batched
+    new_kspace_loc : np.ndarray
+        Same as before (trajectory locations), independent of batch
     """
+
+    # ----------------------------
+    # (1) Normalize input shape: force batch dim
+    # ----------------------------
+    batched = (kspace_data.ndim >= 2)  # always true, but we check whether it already has batch
+    if kspace_data.ndim >= 3:
+        # Assume [B, C, ...]
+        B, C = kspace_data.shape[0], kspace_data.shape[1]
+        kspace_data_bc = kspace_data
+        squeeze_batch = False
+    else:
+        # Assume [C, ...] -> make it [1, C, ...]
+        C = kspace_data.shape[0]
+        B = 1
+        kspace_data_bc = kspace_data[None, ...]
+        squeeze_batch = True
+
+    # ----------------------------
+    # Original logic (trajectory-only parts unchanged)
+    # ----------------------------
     grads = np.diff(kspace_shots, axis=1)
-    re_kspace_data = kspace_data.reshape(kspace_data.shape[0], kspace_data.shape[1], *kspace_shots.shape[:2])
+
+    # ----------------------------
+    # (2) Reshape k-space data with batch: [B, C, rows, cols]
+    #     Original: [C, rows, cols]
+    # ----------------------------
+    re_kspace_data = kspace_data_bc.reshape(B, C, *kspace_shots.shape[:2])
+
     mask = grads[..., 1] == 0
     pad_mask = np.pad(mask, ((0, 0), (1, 1)), constant_values=False)
-    mask = np.diff(pad_mask*1)
+    mask = np.diff(pad_mask * 1)
     starts = np.argwhere(mask == 1)
     ends = np.argwhere(mask == -1)
-    osf = 1/np.mean(np.diff(kspace_shots[kspace_shots.shape[0]//2, kspace_shots.shape[1]//2-calc_osf_buffer:kspace_shots.shape[1]//2+calc_osf_buffer, 0])*traj_params['img_size'][0])
-    max_length = np.zeros(grads.shape[0]) + osf # To ensure we have atleast one point after resampling
-    locs = np.ones((grads.shape[0], 2))*-1
+
+    osf = 1 / np.mean(
+        np.diff(
+            kspace_shots[
+                kspace_shots.shape[0] // 2,
+                kspace_shots.shape[1] // 2 - calc_osf_buffer : kspace_shots.shape[1] // 2 + calc_osf_buffer,
+                0,
+            ]
+        )
+        * traj_params["img_size"][0]
+    )
+
+    max_length = np.zeros(grads.shape[0]) + osf  # ensure >= 1 point after resampling
+    locs = np.ones((grads.shape[0], 2)) * -1
     sampled_loc = [[],] * grads.shape[0]
     cart_loc = [[],] * grads.shape[0]
+
     new_kspace_data = []
     new_kspace_loc = []
-    gridded_data = np.zeros((kspace_data.shape[0], kspace_data.shape[1], *traj_params['img_size']), dtype=np.complex64)
+
+    # ----------------------------
+    # (3) gridded_data now includes batch dim: [B, C, *img_size]
+    #     Original: [C, *img_size]
+    # ----------------------------
+    gridded_data = np.zeros((B, C, *traj_params["img_size"]), dtype=np.complex64)
+
     for start, end in zip(starts, ends):
         row, start_col = start
         _, end_col = end
@@ -112,35 +152,84 @@ def get_cart_portion_sparkling(kspace_shots, traj_params, kspace_data, calc_osf_
             locs[row, 1] = end_col
             cart_loc[row] = np.copy(kspace_shots[row, start_col:end_col])
             sampled_loc[row] = [start_col, end_col]
-    for row, (locs, s_loc) in enumerate(zip(cart_loc, sampled_loc)):
-        if not len(locs) or int(
-                (s_loc[1]-s_loc[0])*
-                np.diff(kspace_shots[row, s_loc[0]:s_loc[0]+2, 0])*traj_params['img_size'][0]
-            ) == 0:
-            new_kspace_data.append(re_kspace_data[:, row])
+
+    for row, (locs_row, s_loc) in enumerate(zip(cart_loc, sampled_loc)):
+        if (
+            not len(locs_row)
+            or int(
+                (s_loc[1] - s_loc[0])
+                * np.diff(kspace_shots[row, s_loc[0] : s_loc[0] + 2, 0])
+                * traj_params["img_size"][0]
+            )
+            == 0
+        ):
+            # ----------------------------
+            # (4) Batched append: re_kspace_data[:, :, row] instead of re_kspace_data[:, row]
+            # ----------------------------
+            new_kspace_data.append(re_kspace_data[:, :, row])  # [B, C, cols]
             new_kspace_loc.append(kspace_shots[row, ...])
             continue
-        data = sp.signal.resample(
-            re_kspace_data[:, row, s_loc[0]: s_loc[1]],
-            int(
-                (s_loc[1]-s_loc[0])*
-                np.diff(kspace_shots[row, s_loc[0]:s_loc[0]+2, 0])*traj_params['img_size'][0]
-            ),
-            axis=-1,
+
+        n_resamp = int(
+            (s_loc[1] - s_loc[0])
+            * np.diff(kspace_shots[row, s_loc[0] : s_loc[0] + 2, 0])
+            * traj_params["img_size"][0]
         )
-        new_kspace_data.append(np.hstack([
-            re_kspace_data[:, row, :s_loc[0]],
-            re_kspace_data[:, row, s_loc[1]:]
-        ]))
-        new_kspace_loc.append(np.concatenate([
-            kspace_shots[row, :s_loc[0]],
-            kspace_shots[row, s_loc[1]:],
-        ], axis=0))
-        locs += 0.5
-        locs *= np.asarray(traj_params["img_size"]).T
-        rounded_locs = locs.round(0).astype('int')
-        gridded_data[:, rounded_locs[0][0]:rounded_locs[0][0]+len(data[0]), rounded_locs[0][1], rounded_locs[0][2]] = data
-    return gridded_data, np.hstack(new_kspace_data), np.concatenate(new_kspace_loc, axis=0)
+
+        # ----------------------------
+        # (5) Resample along last axis, preserving [B, C, ...]
+        #     Original was [C, ...]
+        # ----------------------------
+        data = sp.signal.resample(
+            re_kspace_data[:, :, row, s_loc[0] : s_loc[1]],  # [B, C, seglen]
+            n_resamp,
+            axis=-1,
+        )  # -> [B, C, n_resamp]
+
+        new_kspace_data.append(
+            np.concatenate(
+                [re_kspace_data[:, :, row, : s_loc[0]], re_kspace_data[:, :, row, s_loc[1] :]],
+                axis=-1,
+            )
+        )  # [B, C, cols - seglen]
+
+        new_kspace_loc.append(
+            np.concatenate([kspace_shots[row, : s_loc[0]], kspace_shots[row, s_loc[1] :]], axis=0)
+        )
+
+        # grid placement (same as before)
+        locs_grid = locs_row + 0.5
+        locs_grid *= np.asarray(traj_params["img_size"]).T
+        rounded_locs = locs_grid.round(0).astype("int")
+
+        r0 = rounded_locs[0][0]
+        r1 = r0 + data.shape[-1]
+        c1 = rounded_locs[0][1]
+        c2 = rounded_locs[0][2]
+
+        # ----------------------------
+        # (6) Assign batched data: gridded_data[:, :, ...] = data
+        #     Original: gridded_data[:, ...] = data
+        # ----------------------------
+        gridded_data[:, :, r0:r1, c1, c2] = data
+
+    # ----------------------------
+    # (7) Stack new_kspace_data into array
+    #     We have a list of [B, C, L_row] with varying L_row, so legacy code used hstack.
+    #     We'll keep the same behavior: concatenate over last axis.
+    # ----------------------------
+    new_kspace_data_arr = np.concatenate(new_kspace_data, axis=-1) if len(new_kspace_data) else np.empty((B, C, 0))
+    new_kspace_loc_arr = np.concatenate(new_kspace_loc, axis=0) if len(new_kspace_loc) else np.empty((0,) + kspace_shots.shape[1:])
+
+    # ----------------------------
+    # (8) If input was unbatched, squeeze batch dim to preserve old API
+    # ----------------------------
+    if squeeze_batch:
+        gridded_data = gridded_data[0]
+        new_kspace_data_arr = new_kspace_data_arr[0]
+
+    return gridded_data, new_kspace_data_arr, new_kspace_loc_arr
+    
     
 def pad_back_to_size(sig, vol_shape, start_loc, end_loc):
     """Pads a given signal tensor back to a specified volume shape.
@@ -171,25 +260,20 @@ def pad_back_to_size(sig, vol_shape, start_loc, end_loc):
                    start_kx-start_loc[2]+1:start_kx+end_loc[2]-1] = sig
     return rec
 
-def extract_sampled_regions(sig, acs_only=True):
+
+def extract_sampled_regions(sig: torch.Tensor, acs_only: bool = True):
     """Extracts the Auto-Calibration Signal (ACS) region from the input signal.
-    This is a generic function which finds all the regions that is continuously sampled 
-    in the center of k-space.
 
-    Parameters
-    ----------
-    sig : torch.Tensor
-        A 4D tensor with shape (coils, ky, kz, kx) representing the input signal.
-    acs_only : bool, optional
-        If True, the function will return the ACS region only. Default: True.
-        If False, the function will return a region within which sampling starts.
+    Now supports batched input:
+        sig shape: (B, C, ky, kz, kx)
 
-    Returns
-    -------
-    torch.Tensor
-        A 4D tensor containing the extracted ACS region from the input signal.
+    Notes
+    -----
+    This keeps the original behavior of computing the ACS box using coil 0 and
+    the center line. The same crop is then applied to all coils and all batches.
     """
-    _, ky, kz, kx = sig.shape
+    # sig: (B, C, ky, kz, kx)
+    B, C, ky, kz, kx = sig.shape
 
     start_ky = ky // 2
     start_kz = kz // 2
@@ -197,28 +281,37 @@ def extract_sampled_regions(sig, acs_only=True):
 
     torch_fn = torch.min
     if acs_only:
-        sig_ = (abs(sig) == 0)
+        sig_ = (sig.abs() == 0)
     else:
-        sig_ = (abs(sig) != 0)
+        sig_ = (sig.abs() != 0)
         torch_fn = torch.max
 
+    # Use batch 0, coil 0 to determine bounds (same idea as original: coil 0).
+    # Slices are now indexed as: sig_[b, c, ky, kz, kx]
+    left_start_ky = torch_fn(torch.nonzero(sig_[0, 0, start_ky:, start_kz, start_kx], as_tuple=False)).item()
+    left_end_ky   = torch_fn(torch.nonzero(sig_[0, 0, :start_ky+1, start_kz, start_kx].flip(0), as_tuple=False)).item()
 
-    left_start_ky = torch_fn(torch.nonzero(sig_[0, start_ky:, start_kz, start_kx], as_tuple=False)).item()
-    left_end_ky = torch_fn(torch.nonzero(sig_[0, :start_ky+1, start_kz, start_kx].flip(0), as_tuple=False)).item()
+    left_start_kz = torch_fn(torch.nonzero(sig_[0, 0, start_ky, start_kz:, start_kx], as_tuple=False)).item()
+    left_end_kz   = torch_fn(torch.nonzero(sig_[0, 0, start_ky, :start_kz+1, start_kx].flip(0), as_tuple=False)).item()
 
-    left_start_kz = torch_fn(torch.nonzero(sig_[0, start_ky, start_kz:, start_kx], as_tuple=False)).item()
-    left_end_kz = torch_fn(torch.nonzero(sig_[0, start_ky, :start_kz+1, start_kx].flip(0), as_tuple=False)).item()
+    left_start_kx = torch_fn(torch.nonzero(sig_[0, 0, start_ky, start_kz, start_kx:], as_tuple=False)).item()
+    left_end_kx   = torch_fn(torch.nonzero(sig_[0, 0, start_ky, start_kz, :start_kx+1].flip(0), as_tuple=False)).item()
 
-    left_start_kx = torch_fn(torch.nonzero(sig_[0, start_ky, start_kz, start_kx:], as_tuple=False)).item()
-    left_end_kx = torch_fn(torch.nonzero(sig_[0, start_ky, start_kz, :start_kx+1].flip(0), as_tuple=False)).item()
+    # Compute slice bounds exactly as before
+    ky0 = start_ky - left_start_ky + 1
+    ky1 = start_ky + left_end_ky   - 1
+    kz0 = start_kz - left_start_kz + 1
+    kz1 = start_kz + left_end_kz   - 1
+    kx0 = start_kx - left_start_kx + 1
+    kx1 = start_kx + left_end_kx   - 1
 
-    center = sig[:,   start_ky-left_start_ky+1:start_ky+left_end_ky-1,
-                    start_kz-left_start_kz+1:start_kz+left_end_kz-1,
-                    start_kx-left_start_kx+1:start_kx+left_end_kx-1]
+    center = sig[:, :, ky0:ky1, kz0:kz1, kx0:kx1]
+
     if acs_only:
         return center
+
     start_loc = (left_start_ky, left_start_kz, left_start_kx)
-    end_loc = (left_end_ky, left_end_kz, left_end_kx)
+    end_loc   = (left_end_ky,   left_end_kz,   left_end_kx)
     return center, start_loc, end_loc
     
 
