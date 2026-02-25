@@ -88,7 +88,7 @@ def get_cart_portion_sparkling(kspace_shots, traj_params, kspace_data, calc_osf_
         The gridded k-space data with the Cartesian portion resampled and placed in the appropriate locations.
     """
     grads = np.diff(kspace_shots, axis=1)
-    re_kspace_data = kspace_data.reshape(kspace_data.shape[0], *kspace_shots.shape[:2])
+    re_kspace_data = kspace_data.reshape(kspace_data.shape[0], kspace_data.shape[1], *kspace_shots.shape[:2])
     mask = grads[..., 1] == 0
     pad_mask = np.pad(mask, ((0, 0), (1, 1)), constant_values=False)
     mask = np.diff(pad_mask*1)
@@ -101,7 +101,7 @@ def get_cart_portion_sparkling(kspace_shots, traj_params, kspace_data, calc_osf_
     cart_loc = [[],] * grads.shape[0]
     new_kspace_data = []
     new_kspace_loc = []
-    gridded_data = np.zeros((kspace_data.shape[0], *traj_params['img_size']), dtype=np.complex64)
+    gridded_data = np.zeros((kspace_data.shape[0], kspace_data.shape[1], *traj_params['img_size']), dtype=np.complex64)
     for start, end in zip(starts, ends):
         row, start_col = start
         _, end_col = end
