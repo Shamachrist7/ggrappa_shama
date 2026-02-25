@@ -231,33 +231,47 @@ def get_cart_portion_sparkling(kspace_shots, traj_params, kspace_data, calc_osf_
     return gridded_data, new_kspace_data_arr, new_kspace_loc_arr
     
     
-def pad_back_to_size(sig, vol_shape, start_loc, end_loc):
-    """Pads a given signal tensor back to a specified volume shape.
-    
-    Parameters
-    ----------
-    sig : torch.Tensor
-        The input signal tensor to be padded.
-    vol_shape : tuple of int
-        The shape of the volume to pad the signal tensor to (ky, kz, kx).
-    start_loc : tuple of int
-        The starting location (ky, kz, kx) for padding.
-    end_loc : tuple of int
-        The ending location (ky, kz, kx) for padding.
-    
-    Returns
-    -------
-    torch.Tensor
-        The padded signal tensor with the specified volume shape.
+def pad_back_to_size(sig: torch.Tensor, vol_shape, start_loc, end_loc):
+    """
+    Pads sig back to vol_shape.
+
+    Supports:
+      - sig shape (C, ky, kz, kx)  -> returns (C, ky, kz, kx)
+      - sig shape (B, C, ky, kz, kx) -> returns (B, C, ky, kz, kx)
     """
     ky, kz, kx = vol_shape
     start_ky = ky // 2
     start_kz = kz // 2
     start_kx = kx // 2
-    rec = torch.zeros((sig.shape[0], *vol_shape), dtype=sig.dtype)
-    rec[:,   start_ky-start_loc[0]+1:start_ky+end_loc[0]-1,
-                   start_kz-start_loc[1]+1:start_kz+end_loc[1]-1,
-                   start_kx-start_loc[2]+1:start_kx+end_loc[2]-1] = sig
+
+    squeeze_batch = False
+    if sig.ndim == 4:
+        # (C, ky, kz, kx) -> (1, C, ky, kz, kx)
+        sig = sig.unsqueeze(0)
+        squeeze_batch = True
+    elif sig.ndim != 5:
+        raise ValueError(f"sig must be 4D or 5D. Got shape {sig.shape}")
+
+    B, C, _, _, _ = sig.shape
+
+    rec = torch.zeros(
+        (B, C, ky, kz, kx),
+        dtype=sig.dtype,
+        device=sig.device,
+    )
+
+    y0 = start_ky - start_loc[0] + 1
+    y1 = start_ky + end_loc[0]   - 1
+    z0 = start_kz - start_loc[1] + 1
+    z1 = start_kz + end_loc[1]   - 1
+    x0 = start_kx - start_loc[2] + 1
+    x1 = start_kx + end_loc[2]   - 1
+
+    rec[:, :, y0:y1, z0:z1, x0:x1] = sig
+
+    if squeeze_batch:
+        rec = rec.squeeze(0)
+
     return rec
 
 
